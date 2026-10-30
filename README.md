@@ -4,20 +4,21 @@ Careflow is a browser-based academic prototype for demonstrating operating syste
 
 ## Run it
 
-Open `index.html` in a modern browser. No installation or server is required. The sample bed board and requests are stored in the browser; use **Reset site data** in browser settings to restore the original sample scenario.
+Open `index.html` in a modern browser to explore the app. The local `file://` preview uses a single-thread fallback because browsers restrict loading Web Workers from local files. For the actual multithreaded demo, open the hosted HTTPS app: `https://arpitsh544.github.io/hospital-bed-allocation-os-pbl/`. The sample board and requests are stored in browser storage; clear the site's storage to restore the original sample scenario.
 
 ## What to demonstrate
 
-- **Priority scheduling and bounded buffer:** Add patient requests, fill the 8-slot queue, then process requests with the three-worker pool.
-- **Concurrency and synchronization:** The worker pool simulates concurrent request preparation. A mutex serializes the critical bed-record update, and a semaphore models limited shared resources.
+- **Priority scheduling and bounded buffer:** Add patient requests to the 8-slot queue, then process them in emergency, urgent, and routine order.
+- **Real browser threads:** On HTTPS, up to three dedicated Web Workers analyze request snapshots in parallel. Workers do not access the page's shared bed records.
+- **Synchronization:** After parallel planning, the browser main thread rechecks each request against the live board and serializes bed updates through a JavaScript promise lock. Capacity checks model limits on beds, nurses, ventilators, and isolation spaces.
 - **Deadlock avoidance:** A Banker's safety check evaluates the resource claim before a request is assigned.
 - **Memory allocation:** The Allocation Lab compares First Fit, Best Fit, and Worst Fit for a contiguous bed block. The ward map represents segments and each bed slot represents a page/partition; scattered gaps illustrate external fragmentation.
-- **Readers–writers:** The OS Concepts page explains concurrent bed-board readers and exclusive allocation writes.
+- **Readers–writers:** The OS Concepts page explains the shared-board idea. In this prototype, reads and writes happen through the browser UI, and writes are serialized on the main thread.
 - **Resource lifecycle:** Assign requests from the queue and click an occupied bed on the Bed Board to discharge its patient and release capacity.
 
 ## Scope
 
-This is an interactive teaching model, not clinical software. It uses sample patients and browser storage. The worker pool, mutex, semaphore, and Banker's check illustrate OS concepts in a single-browser app; they are not a hospital-grade resource manager or real operating-system threads.
+This is an interactive teaching model, not clinical software. It uses sample patients and browser storage. Web Workers are genuine browser background threads for parallel analysis on the hosted HTTPS app. The shared bed records remain on the main thread, which rechecks and serializes assignments. The JavaScript promise lock and resource-capacity checks model synchronization; they are not native operating-system mutex or semaphore primitives.
 
 ## Experiment and evaluation tools
 
@@ -31,5 +32,5 @@ Course: Operating System (CCSEH0303A) · Programme: B.Tech CSE · Group: G-5
 
 ## GitHub Pages
 
-The repository includes `.github/workflows/pages.yml` to deploy the static app on pushes to `main`. In the repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. Once deployed, GitHub provides a URL at `https://<owner>.github.io/<repository>/`.
+The repository includes `.github/workflows/pages.yml` to deploy the static app on pushes to `main`. In the repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. Once deployed, GitHub provides the URL `https://arpitsh544.github.io/hospital-bed-allocation-os-pbl/`.
 
