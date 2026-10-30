@@ -333,9 +333,15 @@
           setWorkerStatus(plan.workerNo, 'commit', `${job.index + 1} / ${jobs.length} priority commits`);
           const liveRequest = state.queue.find(r => r.id === job.request.id);
           if (!liveRequest) return;
-          // Recheck the live board inside the serialized commit before changing shared state.
-          const fit = findFit(liveRequest, strategy);
-          const safety = fit && bankersCheck(liveRequest);
+          // Use the worker's plan if its snapshot is still current; otherwise recalculate live.
+          const boardUnchanged = bedSnapshot.every((bed, index) => {
+            const current = state.beds[index];
+            return current && current.id === bed.id && current.patient === bed.patient && current.equipment === bed.equipment;
+          });
+          const fit = boardUnchanged
+            ? (plan.fit ? { ward: plan.fit.ward, start: plan.fit.start, length: plan.fit.length || liveRequest.beds, startId: plan.fit.startId } : null)
+            : findFit(liveRequest, strategy);
+          const safety = fit && (boardUnchanged ? { safe: plan.safe } : bankersCheck(liveRequest));
           if (!fit || !safety.safe) {
             showToast(`${liveRequest.name} remains queued: no safe matching bed block.`, 'error');
             return;
