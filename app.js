@@ -38,6 +38,7 @@
   let latestExperiment = null;
   let lastSafetyCandidate = null;
   let lockTail = Promise.resolve();
+  const allocationWorkerUrl = new URL('./allocation-worker.js', document.currentScript?.src || window.location.href);
 
   function loadState() {
     try {
@@ -154,8 +155,8 @@
     saveState(); render(); closeModal(); showToast(`${name} added to the priority queue.`);
   }
 
-  function getRuns(ward) {
-    return wardBeds(ward).reduce((runs, bed, index, beds) => {
+  function getRuns(ward, bedRecords = state.beds) {
+    return bedRecords.filter(bed => bed.ward === ward).reduce((runs, bed, index, beds) => {
       if (!bed.patient) {
         const last = runs[runs.length - 1];
         if (last && last.end === index - 1) { last.end = index; last.length++; }
@@ -164,9 +165,9 @@
       return runs;
     }, []);
   }
-  function findFit(request, strategy) {
+  function findFit(request, strategy, bedRecords = state.beds) {
     const wards = request.ward === 'Any' || request.ward === 'all' ? WARDS.map(w => w.name) : [request.ward];
-    const runs = wards.flatMap(w => getRuns(w)).filter(run => run.length >= request.beds);
+    const runs = wards.flatMap(w => getRuns(w, bedRecords)).filter(run => run.length >= request.beds);
     if (!runs.length) return null;
     if (strategy === 'best') runs.sort((a, b) => a.length - b.length || wardOrder().indexOf(a.ward) - wardOrder().indexOf(b.ward) || a.start - b.start);
     else if (strategy === 'worst') runs.sort((a, b) => b.length - a.length || wardOrder().indexOf(a.ward) - wardOrder().indexOf(b.ward) || a.start - b.start);
@@ -185,11 +186,11 @@
     if (beds.some(b => b.ward === 'Ventilator' || b.equipment === 'ventilator')) vector[1] = 1;
     return vector;
   }
-  function bankersCheck(request = null) {
+  function bankersCheck(request = null, bedRecords = state.beds) {
     const resourceKeys = ['beds', 'ventilators', 'nurses', 'isolation'];
     const total = resourceKeys.map(key => RESOURCE_TOTAL[key]);
-    const patients = [...new Set(state.beds.filter(b => b.patient).map(b => b.patient))].map((name, index) => {
-      const held = state.beds.filter(b => b.patient === name);
+    const patients = [...new Set(bedRecords.filter(b => b.patient).map(b => b.patient))].map((name, index) => {
+      const held = bedRecords.filter(b => b.patient === name);
       const allocation = resourceVectorForPatient(name, held);
       return { id: `P${index + 1}`, name, allocation, maximum: [...allocation], need: [0, 0, 0, 0], candidate: false };
     });
@@ -256,54 +257,113 @@
     await previous;
     try { return task(); } finally { unlock(); }
   }
-  function processQueue() {
-    if (processing || !state.queue.length) return;
-    processing = true; renderFullQueue();
-    const workers = 3;
-    const jobs = sortedQueue().map((request, index) => ({ request, workerNo: index % workers + 1 }));
-    const readyResolvers = [];
-    let commitTail = Promise.resolve();
-    const commits = jobs.map((job, index) => {
-      let markReady;
-      const ready = new Promise(resolve => { markReady = resolve; });
-      readyResolvers[index] = markReady;
-      const commit = commitTail.then(() => ready).then(() => withMutex(() => {
-        const liveRequest = state.queue.find(r => r.id === job.request.id);
-        if (!liveRequest) return;
-        const fit = findFit(liveRequest, document.querySelector('input[name="strategy"]:checked')?.value || 'first');
-        const safety = fit && bankersCheck(liveRequest);
-        if (!fit || !safety.safe) {
-          showToast(`${liveRequest.name} remains queued: no safe matching bed block.`, 'error');
-          return;
+  async function analyzeQueue(jobs, strategy, bedSnapshot) {
+    const canUseWorkers = typeof Worker !== 'undefined' && window.location.protocol !== 'file:';
+    if (!canUseWorkers) return analyzeQueueOnMainThread(jobs, strategy, bedSnapshot);
+    const poolSize = Math.min(3, jobs.length);
+    return new Promise(resolve => {
+      const workers = [];
+      const results = new Array(jobs.length);
+      let nextJob = 0;
+      let completed = 0;
+      let failed = false;
+      const stopWorkers = () => workers.forEach(worker => worker.terminate());
+      const sendNext = worker => {
+        if (nextJob >= jobs.length) return;
+        const job = jobs[nextJob++];
+        setWorkerStatus(worker.workerNo, 'analyzing', `${completed} / ${jobs.length} requests analyzed`);
+        worker.postMessage({ index: job.index, workerNo: worker.workerNo, request: job.request, beds: bedSnapshot, wards: WARDS, resourceTotal: RESOURCE_TOTAL, strategy });
+      };
+      const fallBack = () => {
+        if (failed) return;
+        failed = true;
+        stopWorkers();
+        analyzeQueueOnMainThread(jobs, strategy, bedSnapshot).then(resolve);
+      };
+      try {
+        for (let i = 0; i < poolSize; i++) {
+          const worker = new Worker(allocationWorkerUrl);
+          worker.workerNo = i + 1;
+          worker.onmessage = event => {
+            if (failed) return;
+            const result = event.data;
+            results[result.index] = result;
+            completed++;
+            if (completed === jobs.length) {
+              stopWorkers();
+              resolve(results);
+            } else sendNext(worker);
+          };
+          worker.onerror = event => { event.preventDefault(); fallBack(); };
+          workers.push(worker);
         }
-        allocateBeds(liveRequest, fit);
-        state.queue = state.queue.filter(r => r.id !== liveRequest.id);
-        const assigned = wardBeds(fit.ward).slice(fit.start, fit.start + liveRequest.beds).map(b => b.id).join(', ');
-        addActivity(`<strong>${esc(liveRequest.name)}</strong> assigned to ${fit.ward} · ${assigned}`);
-        saveState(); render();
-        showToast(`${liveRequest.name} assigned by Worker ${String(job.workerNo).padStart(2, '0')}.`);
-      }));
-      commitTail = commit;
-      return commit;
-    });
-    const preparations = jobs.map(async (job, index) => {
-      setWorkerStatus(job.workerNo, 'busy');
-      await new Promise(resolve => setTimeout(resolve, 500 + (index % workers) * 110));
-      readyResolvers[index]();
-      await commits[index];
-      setWorkerStatus(job.workerNo, 'idle');
-      renderFullQueue();
-    });
-    Promise.all(preparations).finally(() => {
-      processing = false; renderFullQueue();
-      document.querySelector('.queue-process-bar').innerHTML = '<div><span class="pulse"></span>Worker pool ready</div><span>3 workers · Priority scheduling</span>';
-      render();
+        workers.forEach(sendNext);
+      } catch (_) { fallBack(); }
     });
   }
-  function setWorkerStatus(n, status) {
+  async function analyzeQueueOnMainThread(jobs, strategy, bedSnapshot) {
+    const results = [];
+    const workerCount = Math.min(3, jobs.length);
+    let nextJob = 0;
+    await Promise.all(Array.from({ length: workerCount }, async (_, workerIndex) => {
+      const workerNo = workerIndex + 1;
+      while (nextJob < jobs.length) {
+        const job = jobs[nextJob++];
+        setWorkerStatus(workerNo, 'fallback', 'Local preview: single-thread analysis');
+        await new Promise(resolve => setTimeout(resolve, 90));
+        const fit = findFit(job.request, strategy, bedSnapshot);
+        results[job.index] = { index: job.index, requestId: job.request.id, workerNo, fit: fit ? { ward: fit.ward, start: fit.start, startId: fit.startId } : null, safe: bankersCheck(job.request, bedSnapshot).safe };
+      }
+    }));
+    return results;
+  }
+  async function processQueue() {
+    if (processing || !state.queue.length) return;
+    processing = true; renderFullQueue();
+    const jobs = sortedQueue().map((request, index) => ({ request, index }));
+    const strategy = document.querySelector('input[name="strategy"]:checked')?.value || 'first';
+    const bedSnapshot = structuredClone(state.beds);
+    const bar = document.querySelector('.queue-process-bar');
+    if (bar) bar.innerHTML = '<div><span class="pulse"></span>Parallel request analysis starting</div><span>Up to 3 Web Workers · Priority scheduling</span>';
+    try {
+      const plans = await analyzeQueue(jobs, strategy, bedSnapshot);
+      for (const job of jobs) {
+        const plan = plans[job.index];
+        await withMutex(() => {
+          setWorkerStatus(plan.workerNo, 'commit', `${job.index + 1} / ${jobs.length} priority commits`);
+          const liveRequest = state.queue.find(r => r.id === job.request.id);
+          if (!liveRequest) return;
+          // Recheck the live board inside the serialized commit before changing shared state.
+          const fit = findFit(liveRequest, strategy);
+          const safety = fit && bankersCheck(liveRequest);
+          if (!fit || !safety.safe) {
+            showToast(`${liveRequest.name} remains queued: no safe matching bed block.`, 'error');
+            return;
+          }
+          allocateBeds(liveRequest, fit);
+          state.queue = state.queue.filter(r => r.id !== liveRequest.id);
+          const assigned = wardBeds(fit.ward).slice(fit.start, fit.start + liveRequest.beds).map(b => b.id).join(', ');
+          addActivity(`<strong>${esc(liveRequest.name)}</strong> assigned to ${fit.ward} · ${assigned}`);
+          saveState(); render();
+          showToast(`${liveRequest.name} assigned after Worker ${String(plan.workerNo).padStart(2, '0')} analysis.`);
+        });
+      }
+    } catch (error) {
+      console.error('Queue processing failed', error);
+      showToast('Queue processing could not finish. Please try again.', 'error');
+    } finally {
+      processing = false; renderFullQueue();
+      if (bar) bar.innerHTML = '<div><span class="pulse"></span>Web Worker pool ready</div><span>Parallel analysis · serialized bed commits</span>';
+      render();
+    }
+  }
+  function setWorkerStatus(n, status, detail = '') {
     const bar = document.querySelector('.queue-process-bar');
     if (!bar) return;
-    bar.innerHTML = `<div><span class="pulse"></span>Worker ${String(n).padStart(2, '0')} ${status === 'busy' ? 'in critical section' : 'released lock'}</div><span>Mutex ${status === 'busy' ? 'locked' : 'available'} · Semaphore active</span>`;
+    const worker = `Web Worker ${String(n).padStart(2, '0')}`;
+    const label = status === 'commit' ? 'committing under lock' : status === 'fallback' ? 'local preview fallback' : 'analyzing request';
+    const info = detail || (status === 'commit' ? 'Serialized main-thread update' : 'Parallel planning');
+    bar.innerHTML = `<div><span class="pulse"></span>${worker} ${label}</div><span>${esc(info)}</span>`;
   }
 
   function runLab() {
